@@ -1,0 +1,384 @@
+#!/bin/bash
+
+set -euo pipefail
+
+print_usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Monitor the GSM network for A5/1, A5/3, and A5/4 encryption usage. Write
+the output to CSV files.
+
+If no frequency is provided, the script will automatically find the strongest
+frequency in the area and monitor that frequency.
+
+Options:
+  -h, --help
+    Show this help message and exit
+  --frequency
+    Frequency to monitor (default: strongest frequency in the area)
+    Cannot be used in conjunction with --provider
+  --provider
+    MNC of the provider to monitor (e.g. in Germany: 1 - Telekom, 2 - Vodafone, 3 - O2 ).
+    If not provided, any provider will be monitored.
+    Cannot be used in conjunction with --frequency
+  --output-dir
+    Directory to write the output files to (default: current directory)
+EOF
+}
+
+# Parse arguments
+POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h | --help)
+        print_usage
+        exit 0
+        ;;
+    --frequency)
+        FREQUENCY=$2
+        shift 2
+        ;;
+    --provider)
+        PROVIDER=$2
+        shift 2
+        ;;
+    --output-dir)
+        OUTPUT_DIR=$2
+        shift 2
+        ;;
+    -*)
+        echo >&2 "Error: Unknown option: $1"
+        print_usage
+        exit 1
+        ;;
+    *)
+        POSITIONAL+=("$1") # Save positional arguments in an array
+        shift
+        ;;
+    esac
+done
+set -- "${POSITIONAL[@]}" # Restore positional parameters
+
+# Enable debug mode, uncomment this if you want debug output, but be aware 
+# that it might flood your journalctl for gsm-monitor.service with lots of output
+# when run as a service 
+
+# set -xv
+
+# trap to kill all background processes when the script exits,
+# https://mywiki.wooledge.org/SignalTrap#Special_Note_On_SIGINT_and_SIGQUIT
+# https://stackoverflow.com/questions/360201/how-do-i-kill-background-processes-jobs-when-my-shell-script-exits
+trap 'echo >&2 "Received signal $(($? - 128)), terminating background processes"; JOBS=$(jobs -p); if [ -n "${JOBS}" ]; then kill ${JOBS}; fi' SIGINT SIGTERM EXIT
+
+
+sorted_signals_from_kalibrate_output() {
+    local kalibrate_output=$1
+    echo "$kalibrate_output" | grep "chan:" | awk '{print $2 "," $7}' | cut -d "," -f 2 | sort -g -r
+}
+
+# iterate over the strongest frequencies in the area until we find one for the chosen provider
+# if no signal of chosen provider is found, we need to restart the kalibrate-rtl process
+find_provider_strongest_frequency() {
+    local kalibrate_output
+    local sorted_signals
+    local provider_no
+    # Counter to keep track of how many times we restarted kalibrate-rtl to
+    # search for the provider
+    local restart_kalibrate_ctr=0
+    provider_no=""
+
+    # Keep scanning for signals until we found a signal for the provider
+    while true; do
+        kalibrate_output=$(kal -s EGSM 2>&1)
+
+        # If no supported devices are found, exit with code 1
+        if echo "$kalibrate_output" | grep -q "No supported devices found"; then
+            echo >&2 "No supported devices found"
+            exit 1
+        fi
+
+        # If kalibrate-rtl failed to open the rtlsdr device, exit with code 1
+        if echo "$kalibrate_output" | grep -q "Failed to open rtlsdr device"; then
+            echo >&2 "Failed to open rtlsdr device"
+            exit 1
+        fi
+
+        if echo "$kalibrate_output" | grep -q "error"; then
+            echo >&2 "An error occurred while running kalibrate-rtl"
+            exit 1
+        fi
+
+        sorted_signals=$(sorted_signals_from_kalibrate_output "$kalibrate_output")
+
+        # Check if sorted_signals is empty
+        if [ -z "$sorted_signals" ]; then
+            echo >&2 "No signals found. Retrying..."
+            continue
+        fi
+
+        # Iterate over the sorted signals and return the first frequency that belongs to the specified provider
+        # Take care here and make sure that at least one signal for the correct provider was found, so that we
+        # won't get stuck in an infinite loop if the provider is not available in the area or the signal is too
+        # weak when probing for the provider
+        local values value
+        readarray -t values <<<"$sorted_signals"
+        for value in "${values[@]}"; do
+            # set current provider back to empty string, otherwise it will keep the value from the previous iteration
+            provider_no=""
+            # set current frequency to the frequency of the current signal value
+            current_frequency=$(echo "$kalibrate_output" | grep "${value}" | awk '{print $3}' | \
+                                cut -d "(" -f 2 | head -1 | cut -d "H" -f 1)
+
+            # Use grgsm_livemon and tshark to find the provider number of the current frequency
+            # You can adjust the time tshark has to find the provider number for each found signal
+            # (e.g. 8 seconds) for better performance and resilience, but generally the provider number
+            # should be broadcasted quite regularly and should be found within a few seconds.
+            # We also need a timeout to prevent the script from getting stuck in an infinite loop if the
+            # frequency is not available or our antenna is not working properly.
+            grgsm_livemon_headless -f "${current_frequency}" -g 40 >/dev/null &
+            local provider_grgsm_pid=$!
+            echo >&2 "Started grgsm_livemon_headless to find provider number (PID: ${provider_grgsm_pid})"
+            # Limit to 3 retries to find the provider number for the current frequency
+            local provider_retry_ctr=0
+            while [ -z "$provider_no" ] && [ "$provider_retry_ctr" -lt 3 ]; do
+                provider_retry_ctr=$((provider_retry_ctr + 1))
+                provider_no=$(tshark -i lo -a duration:8 -f udp -w - | tshark -r - -l -Y 'gsm_a.dtap.msg_rr_type==0x1b' \
+                    -T fields -e e212.lai.mnc)
+                provider_no=$(echo "$provider_no" | head -1)
+            done
+            # correctly shutdown tshark and grgsm_livemon
+            pkill -9 tshark || true
+            kill -9 "$provider_grgsm_pid" || true
+
+
+            # If provider_no is still empty, continue with the next frequency
+            if [ -z "$provider_no" ]; then
+                echo >&2 "No provider number found for frequency ${current_frequency}. This likely means that the signal is too weak or
+                or your antenna is not working properly. Testing next signal..."
+                continue
+            fi
+            # Check if the provider found for the frequency matches the chosen provider $PROVIDER
+            # If it matches, return the frequency
+            # If it doesn't match, continue with the next frequency
+            if [ "${provider_no}" -eq "${PROVIDER}" ]; then
+                echo "${current_frequency}"
+                return
+            else
+                # Add this line to explicitly continue to the next iteration of the for loop
+                continue
+            fi
+        done
+
+        # If none of the signals found in the area belong to the chosen provider, restart the kalibrate-rtl process
+        # and start the process again
+        if [ -z "${provider_no}" ]; then
+            echo >&2 "No signals found for provider ${PROVIDER}. Retrying..."
+            # increment the counter for restarting kalibrate-rtl to search for available frequencies of the provider
+            restart_kalibrate_ctr=$((restart_kalibrate_ctr + 1))
+            # if we restarted kalibrate-rtl 5 times and still didn't find a signal for the provider, exit with code 1
+            # to avoid getting stuck in an infinite loop and then docker will restart the container
+            if [ "${restart_kalibrate_ctr}" -gt 5 ]; then
+                echo >&2 "No signals found for provider ${PROVIDER} after 5 retries. Exiting..."
+                exit 1
+            fi
+            # else restart kalibrate-rtl process
+            continue
+        fi
+    done
+}
+
+# function to automatically find the strongest downlink frequency in the
+# area with kalibrate-rtl and set the frequency to the strongest signal
+find_strongest_frequency() {
+    local max_power
+    local sorted_signals
+    local strongest_frequency
+    local kalibrate_output
+    max_power=""
+    sorted_signals=""
+
+    # Keep scanning for signals until at least one signal was found
+    while [ -z "$sorted_signals" ]; do
+        kalibrate_output=$(kal -s EGSM 2>&1)
+
+        # If no supported devices are found, exit with code 1
+        if echo "$kalibrate_output" | grep -q "No supported devices found"; then
+            echo >&2 "No supported devices found"
+            exit 1
+        fi
+
+        # If kalibrate-rtl failed to open the rtlsdr device, exit with code 1
+        if echo "$kalibrate_output" | grep -q "Failed to open rtlsdr device"; then
+            echo >&2 "Failed to open rtlsdr device"
+            exit 1
+        fi
+
+        if echo "$kalibrate_output" | grep -q "error"; then
+            echo >&2 "An error occurred while running kalibrate-rtl"
+            exit 1
+        fi
+
+        sorted_signals=$(sorted_signals_from_kalibrate_output "$kalibrate_output")
+
+        # Check if sorted_signals is empty
+        if [ -z "$sorted_signals" ]; then
+            echo >&2 "No signals found. Retrying..."
+            continue
+        fi
+    done
+
+    max_power=$(echo "$sorted_signals" | head -1)
+    strongest_frequency=$(echo "$kalibrate_output" | grep "$max_power" | awk '{print $3}' | cut -d "(" -f 2 | \
+                          head -1 | cut -d "H" -f 1)
+    echo "${strongest_frequency}"
+}
+
+# Find the Location Area Identity (LAI = MCC + MNC + LAC) and Cell Identity (CI) of the Base Transceiver Station (BTS).
+# For that we need to record the first System Information message 3 (SI3) that is broadcasted by the BTS on the
+# strongest frequency.
+# Use grgsm_livemon to capture the SI3 message and tshark to extract the LAI from the SI3 message.
+find_lai() {
+    local frequency="$1"
+    local lai=""
+    grgsm_livemon_headless -f "$frequency" -g 40 >/dev/null &
+    lai_grgsm_pid=$!
+    echo >&2 "Started grgsm_livemon_headless to find LAI (PID: ${lai_grgsm_pid})"
+    # while LAI is empty, keep running tshark to capture the SI3 message
+    # we need a timeout to prevent the script from getting stuck in an infinite loop
+    # if the signal is too weak or our antenna is not working properly
+    local lai_retry_ctr=0
+    while [ -z "$lai" ] && [ "$lai_retry_ctr" -lt 5 ]; do
+        lai_retry_ctr=$((lai_retry_ctr + 1))
+        lai=$(tshark -i lo -a duration:8 -f udp -w - | tshark -r - -l -Y 'gsm_a.dtap.msg_rr_type==0x1b' \
+            -T fields -E separator=_ -e e212.lai.mcc -e e212.lai.mnc -e gsm_a.lac -e gsm_a.bssmap.cell_ci)
+        lai=$(echo "$lai" | head -1)
+    done
+    # correctly shutdown tshark and grgsm_livemon
+    pkill -9 tshark || true
+    kill -9 "$lai_grgsm_pid" || true
+    # if LAI is still empty, return an error message
+    if [ -z "$lai" ]; then
+        echo >&2 "No Location Area Identity (LAI) found. This likely means that the signal is too weak or
+        or your antenna is not working properly. Exiting..."
+        exit 1
+    fi
+    echo "$lai"
+}
+
+start_grgsm_livemon() {
+    local frequency="$1"
+    grgsm_livemon_headless -f "$frequency" -g 40 >/dev/null &
+    echo >&2 "Started grgsm_livemon_headless (PID: $!)"
+}
+
+start_tshark() {
+    # Use a timestamp for the filename
+    local timestamp
+    timestamp=$(date +%s)
+    # Start capture and parallely run grgsm_livemon
+    tshark -i lo -f udp -w - | tshark -r - -l -Y 'gsm_a.rr.algorithm_identifier' \
+        -T fields -e frame.number -e frame.time -e gsm_a.rr.algorithm_identifier \
+        -E header=y -E separator=, -E quote=d -E occurrence=f \
+        > "${OUTPUT_DIR}/tshark_${FREQUENCY}_${LAI}_${timestamp}.csv" &
+}
+
+# watchdog function to check if grgsm_livemon and tshark are running
+# if not then restart grgsm_livemon and tshark
+# if both are running then check if tshark is receiving packets
+watchdog() {
+    local frequency="$1"
+
+    # check if tshark is running
+    if ! pgrep "tshark" >/dev/null; then
+        echo >&2 "Restarting tshark"
+        start_tshark
+    fi
+
+    # check if grgsm_livemon is running
+    if ! pgrep -f "grgsm_livemon" >/dev/null; then
+        echo >&2 "Restarting grgsm_livemon"
+        start_grgsm_livemon "$frequency"
+        # The check below, which would restart grgsm_livemon if no packets are
+        # received, is not needed if we already restart grgsm_livemon here.
+        return
+    fi
+
+    # run tshark on loopback interface for 30 seconds and count number of packets received
+    local tshark_pid
+    tshark -i lo -f udp -a duration:30 -w /tmp/tshark.pcap &>/dev/null &
+    tshark_pid=$!
+    sleep 35
+    # send sigkill to tshark process if it is still running (the || true is
+    # needed because kill returns a non-zero exit code if the process is not
+    # running and set -e would cause the script to exit)
+    kill -9 $tshark_pid || true
+
+    # count number of packets received
+    local num_packets
+    num_packets=$(tshark -r /tmp/tshark.pcap -Y 'gsm_a.dtap.msg_rr_type==0x1b' | wc -l)
+
+    # if number of received packets is smaller than 20, then exit with code 1
+    if [ "$num_packets" -lt 20 ]; then
+        echo >&2 "Number of packets received: $num_packets is less than expected"
+        echo >&2 "Restarting grgsm_collector"
+        # end grgsm_collector process
+        pkill -9 -f grgsm_livemon_headless
+        pkill -9 tshark
+        # exit instead of restarting grgsm_collector, restarting handled by service
+        exit 1
+    fi
+}
+
+if [ -n "${PROVIDER:-}" ] && [ -n "${FREQUENCY:-}" ]; then
+    echo >&2 "Error: --provider and --frequency can't be used together"
+    print_usage
+    exit 1
+fi
+
+# Check if grgsm_livemon is installed
+if ! command -v grgsm_livemon_headless >/dev/null 2>&1; then
+    echo >&2 "Error: grgsm_livemon is not installed."
+    exit 1
+fi
+
+# Check if tshark is installed
+if ! command -v tshark >/dev/null 2>&1; then
+    echo >&2 "Error: tshark is not installed."
+    exit 1
+fi
+
+# Check if kalibrate-rtl is installed
+if ! command -v kal >/dev/null 2>&1; then
+    cat >&2 <<EOF
+Error: kalibrate-rtl is not installed."
+Please install kalibrate-rtl from https://github.com/steve-m/kalibrate-rtl
+Add the kalibrate-rtl binary to your PATH by running the following command:
+export PATH=$PATH:/path/to/repository/kalibrate-rtl/src/
+or adding the path to kalibrate-rtl to your PATH in your .bashrc or .bash_profile
+EOF
+    exit 1
+fi
+
+if [ -n "${PROVIDER:-}" ]; then
+    FREQUENCY=$(find_provider_strongest_frequency)
+elif [ -z "${FREQUENCY:-}" ]; then
+    FREQUENCY=$(find_strongest_frequency)
+fi
+
+OUTPUT_DIR=${OUTPUT_DIR:-${PWD}}
+
+# Find LAI of the frequency to name the output file
+LAI=$(find_lai "$FREQUENCY")
+
+start_tshark
+start_grgsm_livemon "$FREQUENCY"
+
+# While loop to run watchdog function every 5 minutes
+while true; do
+    # Run sleep in background and wait in the foreground to be able to
+    # handle signals via the trap defined above.
+    sleep 300 &
+    wait $!
+    watchdog "$FREQUENCY"
+done

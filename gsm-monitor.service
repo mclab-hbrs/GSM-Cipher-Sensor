@@ -1,0 +1,32 @@
+[Unit]
+Description=GSM Monitoring in Docker Container
+Documentation=https://github.com/mclab-hbrs/GSM-Cipher-Sensor
+Requires=docker.service
+After=docker.service
+
+## LEGACY: If not started correctly, try to restart the container 10 times in 10 min
+# Try unlimited restarts for testing purposes
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+# You can change the provider here or set different flags for the script
+[Service]
+ExecStartPre=-/usr/bin/docker kill gsm-monitor
+ExecStartPre=-/usr/bin/docker rm gsm-monitor
+ExecStart=/usr/bin/docker run \
+    -v /etc/timezone:/etc/timezone:ro \
+    -v /etc/localtime:/etc/localtime:ro \
+    -v "/var/lib/gsm-monitor/output:/output" \
+    --device=/dev/bus/usb/001/ \
+    --cap-add=NET_RAW --cap-add=NET_ADMIN --cap-drop=ALL \
+    --name gsm-monitor \
+    gsm-monitor --provider 1
+ExecStop=/usr/bin/docker kill gsm-monitor
+
+# If antenna is plugged or not connected, the service will not start correctly
+# Try to restart the service / container every 30 seconds 
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
