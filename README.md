@@ -152,12 +152,12 @@ To find the correct frequency for your use case, there are several possibilities
 3. Using online maps like [cellmapper](https://www.cellmapper.net/map) to find the strongest signal in your area
 
 You can build and run a **docker container** from the ***Dockerfile***:
-   ```
-   docker build -t gsm-monitor .
-   ```
+```
+docker build -t gsm-monitor .
+```
 To run it interactively: 
-```docker
-   /usr/bin/docker -it --rm run \
+```
+/usr/bin/docker -it --rm run \
    -v /etc/timezone:/etc/timezone:ro \
    -v /etc/localtime:/etc/localtime:ro \
    -v "{YOUR_OUTPUT_DIR}:/output" \
@@ -176,40 +176,40 @@ To replicate the deployment options of our paper, there are several things to ta
 
 ### Getting Docker and setting up systemd-service
 
-Clone this repo, transfer it to your Raspberry Pi and build the image there, which will take some time. Alternatively, you can do a cross-platform build for the image with `docker buildx` and transfer it to your Raspi. In case you want to set them up in quantity, it might be best to configure the basics in this section - without any personalized data like ssh keys and then copy the SD images. Runs smoothly on Raspi4's, but has trouble running on Raspi2's.
+Clone this repo, transfer it to your Raspberry Pi and build the image there, which will take some time. Alternatively, you can do a cross-platform build for the image with `docker buildx` and transfer it to your Raspi. In case you want to set them up in quantity, it might be best to configure the basics in this section - without any personalized data like ssh keys - and then copy the SD images. Runs smoothly on Raspi4's, but has trouble running on Raspi2's.
 
 Get docker by running: 
-   ```bash
+   ```
    curl -sSL https://get.docker.com | sh
    sudo usermod -aG docker $USER
    ```
 To have the monitoring run automatically on start-up, have a look at the gsm-monitor.service file. This helps you to register a systemd service in the following way:
 
-1. Config files for systemd services are usually saved at `/etc/systemd/system/<service_name>.service` or `/lib/systemd/system/<service_name>.service`.
+1. Unit files for systemd services are usually saved at `/etc/systemd/system/<service_name>.service` or `/lib/systemd/system/<service_name>.service`.
 
    So we can create a symbolic link to our custom unit file, e.g. like
-   ```zsh
+   ```
    ln -s path/to/gsm-monitor/gsm-monitor.service /etc/systemd/system/gsm-monitor.service
    ```
 2. Make systemd reload the configuration files of the units:
-   ```zsh
+   ```
    sudo systemctl daemon-reload
    ```
 3. Tell systemd to start the service automatically after boot-up:
-   ```zsh
+   ```
    sudo systemctl enable gsm-monitor.service
    ```
 4. For testing you can run:
-   ```zsh
+   ```
    sudo systemctl start gsm-monitor.service
    sudo systemctl status gsm-monitor.service
    ```
 5. Use `journalctl` to log and monitor the behaviour of your new service (possibly remove various debug flags or set your own in ***gsm-monitor*** script to not clutter the output, the `set -xv` option is commented out by default), e.g.:
-   ```zsh
+   ```
    journalctl -u gsm-monitor.service
    ```
    or 
-   ```bash
+   ```
    journalctl -f -u gsm-monitor.service --since "DD:MM:YYYY hh:mm:ss"
    ```
    for continued print out of new logs and timestamps
@@ -241,32 +241,32 @@ We will focus on the setup of DS3231 on a RaspberryPi 4 here, since it is well s
    ```
 2. Install the RTC unit as shown in the picture (when the raspi is shutdown)
 3. After reboot, make sure the DS3231 is correctly dectected by using ``i2c-tools``:
-   ```bash
+   ```
    sudo apt install i2c-tools
    ```
    and run:
-   ```bash
+   ```
    sudo i2cdetect -y 1
    ```
    If ``UU`` is correctly displayed at position ``0x68``, it is an indication that the correct kernel driver is up and running and the module is detected correctly.
 4. Take a reading from the RTC via:
-   ```bash
+   ```
    sudo hwclock -r
    ```
    compare to the actual time while still connected to the network:
-   ```zsh
+   ```
    date
    ```
    and finally write the current time to the module:
-   ```zsh
+   ```
    sudo hwclock -w
    ```
 5. When you only want to use the RTC (e.g. no network available), disable the `systemd-timesyncd.service` and the only time source after reboot will be the RTC:
-   ```zsh
+   ```
    sudo systemctl disable systemd-timesyncd.service
    ```
 6. You can do a sanity check by cutting any network connection, shutting down the raspi and turning it on after some time has elapsed and checking the boot sequence via:
-   ```bash
+   ```
    sudo dmesg | grep rtc
    ```
 7. Optional: Depending on your OS and Raspi generation you might need to edit ``/lib/udev/hwclock-set`` by commenting out the following lines (result shown):
@@ -343,11 +343,29 @@ When deploying new devices, you want to be able to make it as easy as possible f
 
 To prevent various usb connection/detection, usb-claim errors and driver conflicts for `rtl-sdr` you might want to setup at least the following:
 1. Blacklist DVB drivers:
-`echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/blacklist-rtl.conf`
+   ```
+   echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/blacklist-rtl.conf
+   ```
+   The problem to be prevented here is, that the DVB Linux kernel driver for use in digital TV reception is loaded automatically making the **RTL-SDR** unavailable for **SDR** programs. The above command permanently blacklists the interfering kernel module responsible, preventing it from loading. You could also opt to temporarily unload the DVB driver and check if it indeed worked as intended via:
+   ```
+   sudo rmmod dvb_usb_rtl28xxu      # unload the respective module from the Linux kernel
+   lsmod | grep dvb                 # expecting an empty output here, meaning no such kernel driver is still loaded
+   ```
 2. Get `/etc/udev/rules.d/10-rtl-sdr.rules` from the [Universal Radio Hacker](https://github.com/jopohl/urh/wiki/SDR-udev-rules) github repo as a text file `10-rtl-sdr.rules` and add the `udev` rules:
+
    ```
    cat  10-rtl-sdr.rules | sudo tee /etc/udev/rules.d/10-rtl-sdr.rules
    sudo udevadm control --reload-rules && sudo udevadm trigger
+   ```
+   These rules allow non-root access (`MODE:="0666"`) to the usb interface (`SUBSYSTEMS=="usb"`) for a variety of *rtl dongles*. You can adjust these rules set to only specifiy a rule for your specific device. For example, provided you were using a `Realtek Semiconductor Corp. RTL2838 DVB-T` dongle, find out its vendor and product ID via:
+   ```
+   $ lsusb | grep -i rtl
+   Bus 001 Device 007: ID 0bda:2838 Realtek Semiconductor Corp. RTL2838 DVB-T
+   ```
+   The respective rule then would be:
+   ```
+   # RTL2832U OEM vid/pid, e.g. ezcap EzTV668 (E4000), Newsky TV28T (E4000/R820T) etc.
+   SUBSYSTEMS=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", MODE:="0666"
    ```
 3. We have provided you with two simple and interactive scripts: **setup.sh** and **build.sh**
    * setup.sh: installs docker, blacklists DVB driver, installs udev rules, and configures network connections.
