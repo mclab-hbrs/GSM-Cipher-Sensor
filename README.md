@@ -346,7 +346,7 @@ To prevent various usb connection/detection, usb-claim errors and driver conflic
    ```
    echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/blacklist-rtl.conf
    ```
-   The problem to be prevented here is, that the DVB Linux kernel driver for use in digital TV reception is loaded automatically making the **RTL-SDR** unavailable for **SDR** programs. The above command permanently blacklists the interfering kernel module responsible, preventing it from loading. You could also opt to temporarily unload the DVB driver and check if it indeed worked as intended via:
+   The problem to be prevented here is, that the DVB Linux kernel driver for use in digital TV reception is loaded automatically making the **RTL-SDR** unavailable for **SDR** programs. The above command permanently blacklists the responsible interfering kernel module, preventing it from loading. You could also opt to temporarily unload the DVB driver and check if it indeed worked as intended via:
    ```
    sudo rmmod dvb_usb_rtl28xxu      # unload the respective module from the Linux kernel
    lsmod | grep dvb                 # expecting an empty output here, meaning no such kernel driver is still loaded
