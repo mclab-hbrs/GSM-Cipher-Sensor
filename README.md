@@ -223,7 +223,7 @@ To solve this problem and assure accurate timestamps for long-term monitoring, i
 
 We will focus on the setup of DS3231 on a RaspberryPi 4 here, since it is well supported and highly accurate. For other RTCs and Raspis many steps are similar, but depending on the version of Raspi and/or RTC additional steps might be required like configuring kernel drivers.
 <div style="text-align: center;">
-  <img src="./images/ds3231-rtc-module-for-raspberry-pi.jpg" alt="RTC installed on Raspi" width="400" height="300" >
+  <img src="https://hobbycomponents.com/1940-large_default/ds3231-rtc-module-for-raspberry-pi.jpg" alt="RTC installed on Raspi" width="400" height="300" >
 </div>
 
 1. Enable I2C: DS3231 module is connected via I2C, which is not enabled by default. To enable, you need to go to the settings:
