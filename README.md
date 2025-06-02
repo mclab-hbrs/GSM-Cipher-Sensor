@@ -5,7 +5,7 @@ SDR based Sensor to capture Cipher Mode Command (CMC) messages
 
 Note: This is the software companion repository for our paper:
 
-<a id="paper">***A5/1 is in the Air: Passive Detection of 2G (GSM) Ciphering Algorithms*** [forthcoming]</a>
+<a id="paper">***A5/1 is in the Air: Passive Detection of 2G (GSM) Ciphering Algorithms*** [forthcoming, [link to arxiv preprint](https://arxiv.org/abs/2505.14509)]</a>
 
 *Authors:* Matthias Koch, Christian Nettersheim, Thorsten Horstmann, Michael Rademacher
 
